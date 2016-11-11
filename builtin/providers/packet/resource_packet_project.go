@@ -1,6 +1,8 @@
 package packet
 
 import (
+	"errors"
+
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/packethost/packngo"
 )
@@ -42,16 +44,14 @@ func resourcePacketProject() *schema.Resource {
 }
 
 func resourcePacketProjectCreate(d *schema.ResourceData, meta interface{}) error {
-	client := meta.(*packngo.Client)
-
 	createRequest := &packngo.ProjectCreateRequest{
 		Name:          d.Get("name").(string),
 		PaymentMethod: d.Get("payment_method").(string),
 	}
 
-	project, _, err := client.Projects.Create(createRequest)
+	project, err := findOrCreateProject(meta.(*packngo.Client), createRequest)
 	if err != nil {
-		return friendlyError(err)
+		return err
 	}
 
 	d.SetId(project.ID)
@@ -62,7 +62,24 @@ func resourcePacketProjectCreate(d *schema.ResourceData, meta interface{}) error
 func resourcePacketProjectRead(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*packngo.Client)
 
-	key, _, err := client.Projects.Get(d.Id())
+	if d.Id() == "" {
+		projects, _, err := client.Projects.List()
+		if err != nil {
+			return friendlyError(err)
+		}
+		name := d.Get("name").(string)
+		for _, project := range projects {
+			if project.Name == name {
+				d.Set("id", project.ID)
+				d.Set("created", project.Created)
+				d.Set("updated", project.Updated)
+				return nil
+			}
+		}
+		return errors.New("no project id")
+	}
+
+	project, _, err := client.Projects.Get(d.Id())
 	if err != nil {
 		err = friendlyError(err)
 
@@ -76,10 +93,10 @@ func resourcePacketProjectRead(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
-	d.Set("id", key.ID)
-	d.Set("name", key.Name)
-	d.Set("created", key.Created)
-	d.Set("updated", key.Updated)
+	d.Set("id", project.ID)
+	d.Set("name", project.Name)
+	d.Set("created", project.Created)
+	d.Set("updated", project.Updated)
 
 	return nil
 }
@@ -114,4 +131,22 @@ func resourcePacketProjectDelete(d *schema.ResourceData, meta interface{}) error
 
 	d.SetId("")
 	return nil
+}
+
+func findOrCreateProject(client *packngo.Client, createRequest *packngo.ProjectCreateRequest) (*packngo.Project, error) {
+	projects, _, err := client.Projects.List()
+	if err != nil {
+		return nil, friendlyError(err)
+	}
+	for _, project := range projects {
+		if project.Name == createRequest.Name {
+			return &project, nil
+		}
+	}
+
+	project, _, err := client.Projects.Create(createRequest)
+	if err != nil {
+		return nil, friendlyError(err)
+	}
+	return project, nil
 }

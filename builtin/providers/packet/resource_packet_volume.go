@@ -238,10 +238,7 @@ func resourcePacketVolumeRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	d.Set("snapshot_policies", snapshot_policies)
 
-	attachments := make([]*packngo.Attachment, 0, len(volume.Attachments))
-	for _, attachment := range volume.Attachments {
-		attachments = append(attachments, attachment)
-	}
+	attachments := append(make([]*packngo.Attachment, 0, len(volume.Attachments)), volume.Attachments...)
 	d.Set("attachments", attachments)
 
 	return nil

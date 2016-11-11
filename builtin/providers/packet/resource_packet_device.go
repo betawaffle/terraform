@@ -3,6 +3,7 @@ package packet
 import (
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/hashicorp/terraform/helper/resource"
@@ -19,9 +20,10 @@ func resourcePacketDevice() *schema.Resource {
 
 		Schema: map[string]*schema.Schema{
 			"project_id": &schema.Schema{
-				Type:     schema.TypeString,
-				Required: true,
-				ForceNew: true,
+				Type:        schema.TypeString,
+				Required:    true,
+				ForceNew:    true,
+				DefaultFunc: schema.EnvDefaultFunc("PACKET_PROJECT_ID", nil),
 			},
 
 			"hostname": &schema.Schema{
@@ -50,7 +52,8 @@ func resourcePacketDevice() *schema.Resource {
 
 			"billing_cycle": &schema.Schema{
 				Type:     schema.TypeString,
-				Required: true,
+				Default:  "hourly",
+				Optional: true,
 				ForceNew: true,
 			},
 
@@ -61,7 +64,8 @@ func resourcePacketDevice() *schema.Resource {
 
 			"locked": &schema.Schema{
 				Type:     schema.TypeBool,
-				Computed: true,
+				Default:  false,
+				Optional: true,
 			},
 
 			"network": &schema.Schema{
@@ -97,6 +101,21 @@ func resourcePacketDevice() *schema.Resource {
 				},
 			},
 
+			"public_ipv4": &schema.Schema{
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"public_ipv6": &schema.Schema{
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"private_ipv4": &schema.Schema{
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
 			"created": &schema.Schema{
 				Type:     schema.TypeString,
 				Computed: true,
@@ -110,16 +129,34 @@ func resourcePacketDevice() *schema.Resource {
 			"user_data": &schema.Schema{
 				Type:     schema.TypeString,
 				Optional: true,
+				ForceNew: true,
 			},
 
 			"tags": &schema.Schema{
 				Type:     schema.TypeList,
 				Optional: true,
+				ForceNew: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 			},
 		},
 	}
 }
+
+var (
+	creationStates = []string{
+		"queued",       // In line, waiting to start.
+		"provisioning", // Configuring switches and installing OS.
+		"active",       // Done and ready to go!
+	}
+	creationStateInfo = map[string]struct {
+		Description string
+		Timeout     time.Duration
+	}{
+		"queued":       {"Queued for Provisioning", 1 * time.Minute}, // This should actually happen instantly.
+		"provisioning": {"Provisioning Started", 60 * time.Minute},
+		"active":       {"Device Active", 20 * time.Minute},
+	}
+)
 
 func resourcePacketDeviceCreate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*packngo.Client)
@@ -152,17 +189,23 @@ func resourcePacketDeviceCreate(d *schema.ResourceData, meta interface{}) error 
 	}
 
 	d.SetId(newDevice.ID)
+	log.Printf("[INFO] Device ID: %s", d.Id())
 
-	// Wait for the device so we can get the networking attributes that show up after a while.
-	_, err = waitForDeviceAttribute(d, "active", []string{"queued", "provisioning"}, "state", meta)
-	if err != nil {
-		if isForbidden(err) {
-			// If the device doesn't get to the active state, we can't recover it from here.
-			d.SetId("")
+	for i, state := range creationStates {
+		stateInfo := creationStateInfo[state]
 
-			return errors.New("provisioning time limit exceeded; the Packet team will investigate")
+		_, err = waitForDeviceState(d, meta, state, creationStates[:i], stateInfo.Timeout)
+		if err != nil {
+			if isForbidden(err) {
+				// If the device doesn't get to the active state, we can't recover it from here.
+				d.SetId("")
+
+				return errors.New("provisioning failed; the Packet team will investigate")
+			}
+			return err
 		}
-		return err
+
+		log.Printf("[INFO] Device %s: %s", stateInfo.Description, d.Id())
 	}
 
 	return resourcePacketDeviceRead(d, meta)
@@ -194,38 +237,10 @@ func resourcePacketDeviceRead(d *schema.ResourceData, meta interface{}) error {
 	d.Set("created", device.Created)
 	d.Set("updated", device.Updated)
 
-	tags := make([]string, 0, len(device.Tags))
-	for _, tag := range device.Tags {
-		tags = append(tags, tag)
-	}
+	tags := append(make([]string, 0, len(device.Tags)), device.Tags...)
 	d.Set("tags", tags)
 
-	var (
-		host     string
-		networks = make([]map[string]interface{}, 0, 1)
-	)
-	for _, ip := range device.Network {
-		network := map[string]interface{}{
-			"address": ip.Address,
-			"gateway": ip.Gateway,
-			"family":  ip.AddressFamily,
-			"cidr":    ip.Cidr,
-			"public":  ip.Public,
-		}
-		networks = append(networks, network)
-
-		if ip.AddressFamily == 4 && ip.Public == true {
-			host = ip.Address
-		}
-	}
-	d.Set("network", networks)
-
-	if host != "" {
-		d.SetConnInfo(map[string]string{
-			"type": "ssh",
-			"host": host,
-		})
-	}
+	setDeviceIPs(d, device.Network)
 
 	return nil
 }
@@ -258,16 +273,64 @@ func resourcePacketDeviceDelete(d *schema.ResourceData, meta interface{}) error 
 	return nil
 }
 
-func waitForDeviceAttribute(d *schema.ResourceData, target string, pending []string, attribute string, meta interface{}) (interface{}, error) {
+func setDeviceIPs(d *schema.ResourceData, ips []*packngo.IPAddress) {
+	if len(ips) == 0 {
+		return
+	}
+	var (
+		networks = make([]map[string]interface{}, 0, len(ips))
+	)
+	for _, ip := range ips {
+		networks = append(networks, map[string]interface{}{
+			"address": ip.Address,
+			"gateway": ip.Gateway,
+			"family":  ip.AddressFamily,
+			"cidr":    ip.Cidr,
+			"public":  ip.Public,
+		})
+
+		var key string
+		if ip.Public {
+			switch ip.AddressFamily {
+			case 4:
+				key = "public_ipv4"
+			case 6:
+				key = "public_ipv6"
+			}
+		} else if ip.AddressFamily == 4 {
+			key = "private_ipv4"
+		}
+		if key != "" {
+			// Only set, never update.
+			if _, ok := d.GetOk(key); !ok {
+				d.Set(key, ip.Address)
+			}
+		}
+	}
+	d.Set("network", networks)
+
+	if host, ok := d.Get("public_ipv4").(string); ok && host != "" {
+		d.SetConnInfo(map[string]string{
+			"type": "ssh",
+			"host": host,
+		})
+	}
+}
+
+func waitForDeviceState(d *schema.ResourceData, meta interface{}, target string, pending []string, timeout time.Duration) (string, error) {
+	if timeout == 0 {
+		timeout = 60 * time.Minute
+	}
 	stateConf := &resource.StateChangeConf{
 		Pending:    pending,
 		Target:     []string{target},
-		Refresh:    newDeviceStateRefreshFunc(d, attribute, meta),
-		Timeout:    60 * time.Minute,
+		Refresh:    newDeviceStateRefreshFunc(d, "state", meta),
+		Timeout:    timeout,
 		Delay:      10 * time.Second,
 		MinTimeout: 3 * time.Second,
 	}
-	return stateConf.WaitForState()
+	v, err := stateConf.WaitForState()
+	return v.(string), err
 }
 
 func newDeviceStateRefreshFunc(d *schema.ResourceData, attribute string, meta interface{}) resource.StateRefreshFunc {
@@ -298,6 +361,6 @@ func powerOnAndWait(d *schema.ResourceData, meta interface{}) error {
 		return friendlyError(err)
 	}
 
-	_, err = waitForDeviceAttribute(d, "active", []string{"off"}, "state", client)
+	_, err = waitForDeviceState(d, meta, "active", []string{"off"}, 2*time.Minute)
 	return err
 }
